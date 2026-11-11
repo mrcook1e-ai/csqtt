@@ -9,9 +9,10 @@ use anyhow::Result;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_queue::ArrayQueue;
 use socket2::SockRef;
+#[cfg(all(test, unix))]
+use std::fs::File;
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
     future::Future,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -532,19 +533,35 @@ impl Dispatcher {
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
             termination: Arc::new(OnceLock::new()),
         });
+        Self::start_native_tun(&dispatcher, "test TUN dispatcher", file.into(), pool, stats).await;
+        Ok(dispatcher)
+    }
+
+    /// Starts the TUN I/O session for a device owned by this process (native
+    /// utun on macOS, or a raw fd in tests). The replacement sender must stay
+    /// alive until `run_tun` returns: a closed replacement channel makes
+    /// `replacements.recv()` resolve immediately, and the first `select!` in
+    /// `run_tun` would tear the I/O generation down right after startup.
+    async fn start_native_tun(
+        dispatcher: &Arc<Self>,
+        task_name: &'static str,
+        device: crate::tun::TunDevice,
+        pool: Arc<PacketPool>,
+        stats: Arc<Stats>,
+    ) {
         let io_dispatcher = dispatcher.clone();
-        let task = spawn_critical(
-            "test TUN dispatcher",
-            cancel,
+        let task_cancel = dispatcher.cancel.clone();
+        let io_task = spawn_critical(
+            task_name,
+            task_cancel,
             dispatcher.termination.clone(),
             async move {
-                let (fd_tx, mut fd_rx) = mpsc::channel(1);
-                io_dispatcher.run_tun(file, pool, stats, &mut fd_rx).await;
+                let (fd_tx, mut fd_rx) = mpsc::channel::<crate::tun::TunDevice>(1);
+                io_dispatcher.run_tun(device, pool, stats, &mut fd_rx).await;
                 drop(fd_tx);
             },
         );
-        dispatcher.tasks.lock().await.push(task);
-        Ok(dispatcher)
+        dispatcher.tasks.lock().await.push(io_task);
     }
 
     #[cfg(test)]
@@ -560,6 +577,7 @@ impl Dispatcher {
         Self::start_with_domain_routing(
             listen,
             tun_uds,
+            None,
             pool,
             stats,
             cancel,
@@ -569,9 +587,11 @@ impl Dispatcher {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_domain_routing(
         listen: &str,
         tun_uds: Option<String>,
+        native_tun: Option<crate::tun::TunDevice>,
         pool: Arc<PacketPool>,
         stats: Arc<Stats>,
         cancel: CancellationToken,
@@ -640,6 +660,19 @@ impl Dispatcher {
         );
         dispatcher.tasks.lock().await.push(pump_task);
 
+        if let Some(device) = native_tun {
+            crate::log_error!("[КЛИЕНТ] Запуск нативного TUN-диспетчера (utun)...");
+            Self::start_native_tun(
+                &dispatcher,
+                "TUN dispatcher",
+                device,
+                pool.clone(),
+                stats.clone(),
+            )
+            .await;
+            return Ok((dispatcher, "0".to_owned()));
+        }
+
         if let Some(name) = tun_uds {
             crate::log_error!("[КЛИЕНТ] Запуск UDS-слушателя: {name} для получения TUN FD...");
             let bind_name = name.clone();
@@ -653,7 +686,7 @@ impl Dispatcher {
                     return Err(anyhow::anyhow!("TUN FD bind task failed: {error}"));
                 }
             };
-            let (fd_tx, mut fd_rx) = mpsc::channel(16);
+            let (fd_tx, mut fd_rx) = mpsc::channel::<crate::tun::TunDevice>(16);
             let receive_cancel = dispatcher.cancel.clone();
             let receive_task = spawn_critical(
                 "TUN FD receiver",
@@ -673,7 +706,7 @@ impl Dispatcher {
                             }
                         };
                         crate::log_error!("[UDS] Новый TUN FD успешно получен из сокета");
-                        if let Err(error) = fd_tx.send(file).await {
+                        if let Err(error) = fd_tx.send(file.into()).await {
                             if receive_cancel.is_cancelled() {
                                 return;
                             }
@@ -832,7 +865,7 @@ impl Dispatcher {
         self.termination.get().copied()
     }
 
-    fn terminate(&self, reason: Termination) {
+    pub(crate) fn terminate(&self, reason: Termination) {
         let _ = self.termination.set(reason);
         self.cancel.cancel();
     }
@@ -857,10 +890,10 @@ impl Dispatcher {
     #[cfg(unix)]
     async fn run_tun(
         self: &Arc<Self>,
-        initial_file: File,
+        initial_file: crate::tun::TunDevice,
         pool: Arc<PacketPool>,
         stats: Arc<Stats>,
-        replacements: &mut mpsc::Receiver<File>,
+        replacements: &mut mpsc::Receiver<crate::tun::TunDevice>,
     ) {
         use tokio::io::unix::AsyncFd;
 
@@ -953,10 +986,10 @@ impl Dispatcher {
     #[cfg(not(unix))]
     async fn run_tun(
         self: &Arc<Self>,
-        _file: File,
+        _file: crate::tun::TunDevice,
         _pool: Arc<PacketPool>,
         _stats: Arc<Stats>,
-        _replacements: &mut mpsc::Receiver<File>,
+        _replacements: &mut mpsc::Receiver<crate::tun::TunDevice>,
     ) {
         crate::log_error!("[ОШИБКА] TUN FD поддерживается только на Android и Unix");
         self.terminate(Termination::TunLost);
@@ -1017,7 +1050,7 @@ impl Dispatcher {
     #[cfg(unix)]
     async fn read_tun(
         self: Arc<Self>,
-        device: Arc<tokio::io::unix::AsyncFd<File>>,
+        device: Arc<tokio::io::unix::AsyncFd<crate::tun::TunDevice>>,
         pool: Arc<PacketPool>,
         stats: Arc<Stats>,
         cancel: CancellationToken,
@@ -1458,7 +1491,7 @@ impl Dispatcher {
     #[cfg(unix)]
     async fn write_tun(
         &self,
-        device: Arc<tokio::io::unix::AsyncFd<File>>,
+        device: Arc<tokio::io::unix::AsyncFd<crate::tun::TunDevice>>,
         stats: Arc<Stats>,
         cancel: CancellationToken,
     ) {
@@ -2312,5 +2345,42 @@ mod tests {
         let idx = state.select(20, 1000, now);
         assert!(idx < 20);
         assert!(state.cursor < 20);
+    }
+
+    /// Regression test for the native utun startup path: the replacement
+    /// sender must outlive `run_tun`. With the channel closed early
+    /// (`drop(fd_tx)` before `run_tun`), the first `select!` in `run_tun`
+    /// resolves immediately and the dispatcher dies with `TunLost` right
+    /// after startup instead of running the I/O session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_tun_io_session_survives_startup() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let (dispatcher_side, _test_side) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        dispatcher_side.set_nonblocking(true).unwrap();
+        let file = unsafe { File::from_raw_fd(dispatcher_side.into_raw_fd()) };
+        let cancel = CancellationToken::new();
+        let pool = PacketPool::new(8);
+        let stats = Arc::new(Stats::default());
+        let dispatcher = Dispatcher::start_test_tun(
+            file,
+            pool,
+            stats,
+            [0u8; 32],
+            crate::obfs::ObfsMode::Unified,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            dispatcher.termination().is_none(),
+            "TUN I/O session was torn down at startup (replacement channel closed too early)"
+        );
+
+        cancel.cancel();
+        dispatcher.shutdown().await;
     }
 }

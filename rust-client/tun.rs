@@ -2,12 +2,15 @@ use anyhow::{Result, bail};
 use std::fs::File;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(unix)]
+// Abstract Unix-domain sockets (used by the Android VpnService app to hand over
+// the TUN fd) exist only on Linux/Android; nix gates UnixAddr::new_abstract the
+// same way, so on macOS and other platforms the receiver is a stub.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub struct FdReceiver {
     listener: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl FdReceiver {
     pub fn bind(name: &str) -> Result<Self> {
         use nix::errno::Errno;
@@ -171,7 +174,7 @@ impl FdReceiver {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn configure_nonblocking(descriptor: std::os::fd::BorrowedFd<'_>) -> Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -186,21 +189,69 @@ fn configure_nonblocking(descriptor: std::os::fd::BorrowedFd<'_>) -> Result<()> 
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub struct FdReceiver;
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl FdReceiver {
     pub fn bind(_name: &str) -> Result<Self> {
-        bail!("TUN FD transport is available only on Android and Unix")
+        bail!("TUN FD transport over abstract UDS is available only on Android and Linux")
     }
 
     pub async fn receive(&self, _cancel: &CancellationToken) -> Result<File> {
-        bail!("TUN FD transport is available only on Android and Unix")
+        bail!("TUN FD transport over abstract UDS is available only on Android and Linux")
     }
 }
 
-#[cfg(all(test, unix))]
+/// TUN packet source consumed by the dispatcher: either a raw fd handed over by
+/// the Android app (Linux/Android abstract UDS) or a native macOS utun device.
+pub enum TunDevice {
+    Fd(File),
+    #[cfg(target_os = "macos")]
+    Utun(crate::utun::UtunDevice),
+}
+
+impl From<File> for TunDevice {
+    fn from(file: File) -> Self {
+        Self::Fd(file)
+    }
+}
+
+impl std::os::fd::AsRawFd for TunDevice {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Fd(file) => std::os::fd::AsRawFd::as_raw_fd(file),
+            #[cfg(target_os = "macos")]
+            Self::Utun(device) => std::os::fd::AsRawFd::as_raw_fd(device),
+        }
+    }
+}
+
+impl std::io::Read for &TunDevice {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            TunDevice::Fd(file) => std::io::Read::read(&mut &*file, buf),
+            #[cfg(target_os = "macos")]
+            TunDevice::Utun(device) => std::io::Read::read(&mut &*device, buf),
+        }
+    }
+}
+
+impl std::io::Write for &TunDevice {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            TunDevice::Fd(file) => std::io::Write::write(&mut &*file, buf),
+            #[cfg(target_os = "macos")]
+            TunDevice::Utun(device) => std::io::Write::write(&mut &*device, buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::FdReceiver;
     use nix::sys::socket::{

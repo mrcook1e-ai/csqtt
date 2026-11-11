@@ -51,6 +51,9 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["socket", "uio"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+tun = "=0.8.14"
+
 [dev-dependencies]
 proptest = "1.11.0"
 tokio = { version = "1.53.1", features = ["test-util"] }

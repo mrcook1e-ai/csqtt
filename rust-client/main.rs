@@ -30,6 +30,8 @@ mod turn_core;
 mod turn_endpoint;
 mod turn_ip_pool;
 mod turn_stream;
+#[cfg(target_os = "macos")]
+mod utun;
 mod vk_js_calls;
 #[path = "../shared/wire_protocol.rs"]
 mod wire_protocol;
@@ -120,6 +122,14 @@ struct Arguments {
     #[arg(long, default_value = "")]
     tun_uds: String,
     #[arg(long, default_value_t = false)]
+    tun_utun: bool,
+    #[arg(long, default_value_t = false)]
+    utun_full_tunnel: bool,
+    #[arg(long, default_value = "10.66.67.1")]
+    utun_peer: String,
+    #[arg(long, default_value_t = 1500)]
+    utun_mtu: u16,
+    #[arg(long, default_value_t = false)]
     validate_vk_hashes: bool,
     #[arg(long = "domain-routing", default_value_t = false)]
     domain_routing: bool,
@@ -187,6 +197,38 @@ fn main() {
     std::process::exit(exit_code);
 }
 
+/// SIGTERM/SIGHUP инициируют тот же graceful shutdown, что и Ctrl-C (иначе при
+/// обычном `kill <pid>` cleanup маршрутов utun не выполняется). На не-Unix
+/// платформах future никогда не завершается.
+#[cfg(unix)]
+async fn terminate_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+    ) {
+        (Ok(mut sigterm), Ok(mut sighup)) => {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sighup.recv() => {}
+            }
+        }
+        (Ok(mut sigterm), Err(_)) => {
+            sigterm.recv().await;
+        }
+        (Err(_), Ok(mut sighup)) => {
+            sighup.recv().await;
+        }
+        (Err(_), Err(_)) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_signal() {
+    std::future::pending::<()>().await
+}
+
 fn build_runtime(default_worker_threads: usize) -> Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(default_worker_threads);
@@ -239,6 +281,14 @@ async fn run(arguments: Arguments) -> Result<i32> {
     let password = std::env::var("CSQTT_PASSWORD").unwrap_or_default();
     if password.is_empty() {
         bail!("[КЛИЕНТ] Нужен пароль в переменной CSQTT_PASSWORD");
+    }
+    let utun_mode = arguments.tun_utun || arguments.utun_full_tunnel;
+    if utun_mode && !arguments.tun_uds.is_empty() {
+        bail!("[КЛИЕНТ] --tun-utun и --tun-uds несовместимы");
+    }
+    #[cfg(not(target_os = "macos"))]
+    if utun_mode {
+        bail!("[КЛИЕНТ] --tun-utun поддерживается только на macOS");
     }
     let mut stdin = spawn_stdin_reader();
     let peer = resolve_peer(&arguments.peer).await?;
@@ -320,9 +370,20 @@ async fn run(arguments: Arguments) -> Result<i32> {
         ip_is_whitelist: arguments.ip_whitelist,
         ip_rules: Arc::new(ip_rules),
     };
+    #[cfg(target_os = "macos")]
+    let (native_tun, utun_device_name) = if utun_mode {
+        let device = utun::UtunDevice::create(arguments.utun_mtu)?;
+        let name = device.name().to_owned();
+        (Some(crate::tun::TunDevice::Utun(device)), Some(name))
+    } else {
+        (None, None)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let native_tun: Option<crate::tun::TunDevice> = None;
     let dispatcher_result = Dispatcher::start_with_domain_routing(
         &arguments.listen,
         tun_uds,
+        native_tun,
         pool.clone(),
         stats.clone(),
         cancel.clone(),
@@ -358,6 +419,36 @@ async fn run(arguments: Arguments) -> Result<i32> {
         parse_custom_turn_ips(raw_turn_ips),
         MAX_WORKERS,
     ));
+    #[cfg(target_os = "macos")]
+    let utun_control = if let Some(name) = utun_device_name {
+        let mut endpoints: Vec<std::net::Ipv4Addr> = Vec::new();
+        if let std::net::IpAddr::V4(ip) = peer.ip() {
+            endpoints.push(ip);
+        }
+        for (host, _) in parse_custom_turn_ips(raw_turn_ips) {
+            match host.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(ip)) => endpoints.push(ip),
+                _ => crate::log_error!(
+                    "[UTUN] Предупреждение: TURN endpoint {host} не является IP-литералом; защита маршрутов покрывает только IP"
+                ),
+            }
+        }
+        endpoints.sort();
+        endpoints.dedup();
+        let peer_ip: std::net::Ipv4Addr = arguments
+            .utun_peer
+            .parse()
+            .context("некорректный --utun-peer")?;
+        Some(Arc::new(utun::UtunControl::new(
+            name,
+            arguments.utun_mtu,
+            peer_ip,
+            arguments.utun_full_tunnel,
+            endpoints,
+        )))
+    } else {
+        None
+    };
     let initial_workers = workers;
     let scale_notify = Arc::new(tokio::sync::Notify::new());
     let params_workers = Arc::new(AtomicUsize::new(initial_workers));
@@ -391,6 +482,12 @@ async fn run(arguments: Arguments) -> Result<i32> {
     let stats_task = tokio::spawn(stats.clone().run(events.clone(), cancel.clone()));
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<String>(32);
     let config_events = events.clone();
+    #[cfg(target_os = "macos")]
+    let utun_control_for_config = utun_control.clone();
+    #[cfg(target_os = "macos")]
+    let config_cancel = cancel.clone();
+    #[cfg(target_os = "macos")]
+    let config_dispatcher = dispatcher.clone();
     let config_task = tokio::spawn(async move {
         let mut last_config = None;
         while let Some(config) = config_rx.recv().await {
@@ -403,6 +500,16 @@ async fn run(arguments: Arguments) -> Result<i32> {
                 let ip = fields.next().unwrap_or_default();
                 let dns = fields.next().unwrap_or_default();
                 crate::log_error!("[КЛИЕНТ] Tunnel IP: {ip}/32 | DNS: {dns}");
+                #[cfg(target_os = "macos")]
+                if let Some(control) = &utun_control_for_config {
+                    if let Err(error) = control.apply_tunnel_config(ip, dns) {
+                        crate::log_error!(
+                            "[UTUN] Не удалось настроить utun, завершаем работу: {error:#}"
+                        );
+                        config_dispatcher.terminate(Termination::Fatal);
+                        config_cancel.cancel();
+                    }
+                }
             }
             config_events.config(&config);
             last_config = Some(config);
@@ -466,6 +573,11 @@ async fn run(arguments: Arguments) -> Result<i32> {
             cancel.cancel();
             false
         }
+        _ = terminate_signal() => {
+            crate::log_error!("[КЛИЕНТ] Получен сигнал завершения (SIGTERM/SIGHUP)");
+            cancel.cancel();
+            false
+        }
         _ = cancel.cancelled() => false,
     };
     cancel.cancel();
@@ -502,7 +614,9 @@ async fn run(arguments: Arguments) -> Result<i32> {
     match termination {
         None => Ok(EXIT_NORMAL),
         Some(Termination::TunLost) => Ok(EXIT_TUN_LOST),
-        Some(Termination::Fatal) => bail!("аварийное завершение TUN или UDP задачи"),
+        Some(Termination::Fatal) => {
+            bail!("аварийное завершение TUN/UDP задачи или ошибка настройки туннеля")
+        }
     }
 }
 
@@ -578,6 +692,10 @@ fn normalize_cli_argument(argument: String) -> String {
         "gen",
         "salt",
         "tun-uds",
+        "tun-utun",
+        "utun-full-tunnel",
+        "utun-peer",
+        "utun-mtu",
         "validate-vk-hashes",
         "domain-routing",
         "exclude-ru-zones",

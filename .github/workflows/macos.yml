@@ -1,0 +1,85 @@
+# CSQTT native macOS client build.
+#
+# Builds the rust-client CLI as a universal2 (aarch64 + x86_64) macOS binary
+# with the native utun TUN backend (--tun-utun, see docs/macos.md).
+# This workflow intentionally covers only rust-client: the Android app (app/)
+# is not a macOS artifact, and rust-server is Linux-only (recvmmsg/sendmmsg,
+# TPROXY/iptables). No Android .so/APK is produced here.
+
+name: macos-client
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "rust-client/**"
+      - "shared/**"
+      - ".github/workflows/macos.yml"
+  pull_request:
+    paths:
+      - "rust-client/**"
+      - "shared/**"
+      - ".github/workflows/macos.yml"
+
+jobs:
+  build:
+    name: Build and test macOS client
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1.97.1 = rust-version in rust-client/Cargo.toml.
+      # cmake is preinstalled on macOS runners and is required by aws-lc-rs.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Check formatting
+        working-directory: rust-client
+        run: cargo fmt -- --check
+
+      - name: Run tests (host arch)
+        working-directory: rust-client
+        run: cargo test --locked
+
+      - name: Build release (aarch64-apple-darwin)
+        working-directory: rust-client
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Build release (x86_64-apple-darwin)
+        working-directory: rust-client
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Create universal2 binary
+        working-directory: rust-client
+        run: |
+          lipo -create \
+            -output csqtt-client-macos-universal2 \
+            target/aarch64-apple-darwin/release/client \
+            target/x86_64-apple-darwin/release/client
+          lipo -info csqtt-client-macos-universal2
+
+      - name: Smoke test binary (no network, no root)
+        working-directory: rust-client
+        run: |
+          set +e
+          output=$(./csqtt-client-macos-universal2 2>&1)
+          code=$?
+          set -e
+          echo "$output"
+          # Without arguments the client must fail fast with a usage error
+          # (exit 1) without touching the network.
+          if [ "$code" -ne 1 ]; then
+            echo "unexpected exit code: $code" >&2
+            exit 1
+          fi
+          echo "$output" | grep -q "peer"
+
+      - name: Upload universal2 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: csqtt-client-macos-universal2
+          path: rust-client/csqtt-client-macos-universal2
+          if-no-files-found: error
