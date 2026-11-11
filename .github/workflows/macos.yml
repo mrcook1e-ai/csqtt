@@ -35,6 +35,7 @@ jobs:
         with:
           toolchain: "1.97.1"
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+          components: rustfmt
 
       - name: Check formatting
         working-directory: rust-client
